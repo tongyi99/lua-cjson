@@ -82,6 +82,7 @@
 #define DEFAULT_ENCODE_EMPTY_TABLE_AS_OBJECT 1
 #define DEFAULT_DECODE_ARRAY_WITH_ARRAY_MT 0
 #define DEFAULT_ENCODE_ESCAPE_FORWARD_SLASH 1
+#define DEFAULT_STORE_NUMBER_AS_RAWDATA 0
 
 #ifdef DISABLE_INVALID_NUMBERS
 #undef DEFAULT_DECODE_INVALID_NUMBERS
@@ -103,11 +104,28 @@
 #endif
 
 #if LUA_VERSION_NUM > 501
-#define lua_objlen(L,i)		lua_rawlen(L, (i))
+#define lua_objlen(L,i)                 lua_rawlen(L, (i))
 #endif
 
 static const char * const *json_empty_array;
 static const char * const *json_array;
+
+static inline void * rawdata_new(lua_State *l, void *data, size_t size) {
+    unsigned int *ptr = lua_newuserdata(l, sizeof(unsigned int) + size);
+    *ptr = (unsigned int)size;
+    memcpy(ptr+1, data, size);
+    return ptr;
+}
+
+static inline void *rawdata_get_data(void *ptr) {
+    unsigned int *p = ptr;
+    return p + 1;
+}
+
+static inline unsigned int rawdata_get_len(void *ptr) {
+    unsigned int *p = ptr;
+    return *p;
+}
 
 typedef enum {
     T_OBJ_BEGIN,
@@ -117,6 +135,7 @@ typedef enum {
     T_STRING,
     T_NUMBER,
     T_BOOLEAN,
+    T_RAWDATA,
     T_NULL,
     T_COLON,
     T_COMMA,
@@ -134,6 +153,7 @@ static const char *json_token_type_name[] = {
     "T_STRING",
     "T_NUMBER",
     "T_BOOLEAN",
+    "T_RAWDATA",
     "T_NULL",
     "T_COLON",
     "T_COMMA",
@@ -165,6 +185,8 @@ typedef struct {
     int decode_invalid_numbers;
     int decode_max_depth;
     int decode_array_with_array_mt;
+
+    int store_number_as_rawdata;
 } json_config_t;
 
 typedef struct {
@@ -463,6 +485,7 @@ static void json_create_config(lua_State *l)
     cfg->encode_empty_table_as_object = DEFAULT_ENCODE_EMPTY_TABLE_AS_OBJECT;
     cfg->decode_array_with_array_mt = DEFAULT_DECODE_ARRAY_WITH_ARRAY_MT;
     cfg->encode_escape_forward_slash = DEFAULT_ENCODE_ESCAPE_FORWARD_SLASH;
+    cfg->store_number_as_rawdata = DEFAULT_STORE_NUMBER_AS_RAWDATA;
 
 #if DEFAULT_ENCODE_KEEP_BUFFER > 0
     strbuf_init(&cfg->encode_buf, 0);
@@ -804,6 +827,14 @@ static void json_append_data(lua_State *l, json_config_t *cfg,
             json_append_array(l, cfg, current_depth, json, 0);
         }
         break;
+    case LUA_TUSERDATA:
+        if (cfg->store_number_as_rawdata) {
+            void *ptr = lua_touserdata(l, -1);
+            unsigned int len = rawdata_get_len(ptr);
+            void *data = rawdata_get_data(ptr);
+            strbuf_append_mem(json, data, len);
+            break;
+        }
     default:
         /* Remaining types (LUA_TFUNCTION, LUA_TUSERDATA, LUA_TTHREAD,
          * and LUA_TLIGHTUSERDATA) cannot be serialised */
@@ -1111,10 +1142,20 @@ static void json_next_number_token(json_parse_t *json, json_token_t *token)
 
     token->type = T_NUMBER;
     token->value.number = fpconv_strtod(json->ptr, &endptr);
-    if (json->ptr == endptr)
+    if (json->ptr == endptr) {
         json_set_token_error(token, json, "invalid number");
-    else
-        json->ptr = endptr;     /* Skip the processed number */
+        return;
+    }
+
+    if (json->cfg->store_number_as_rawdata) {
+        size_t len = endptr - json->ptr;
+
+        token->type = T_RAWDATA;
+        strbuf_reset(json->tmp);
+        strbuf_append_mem_unsafe(json->tmp, json->ptr, len);
+        token->value.string = strbuf_string(json->tmp, &token->string_len);
+    }
+    json->ptr = endptr;     /* Skip the processed number */
 
     return;
 }
@@ -1364,6 +1405,9 @@ static void json_process_value(lua_State *l, json_parse_t *json,
          * Hence a NULL pointer lightuserdata object is used instead */
         lua_pushlightuserdata(l, NULL);
         break;;
+    case T_RAWDATA:
+        (void )rawdata_new(l, (void *)token->value.string, token->string_len);
+        break;;
     default:
         json_throw_parse_error(l, json, "value", token);
     }
@@ -1463,6 +1507,13 @@ static int json_protect_conversion(lua_State *l)
     return luaL_error(l, "Memory allocation error in CJSON protected call");
 }
 
+static int json_cfg_store_number_as_rawdata(lua_State *l)
+{
+    json_config_t *cfg = json_arg_init(l, 1);
+    json_enum_option(l, 1, &cfg->store_number_as_rawdata, NULL, 1);
+    return 1;
+}
+
 /* Return cjson module table */
 static int lua_cjson_new(lua_State *l)
 {
@@ -1479,6 +1530,7 @@ static int lua_cjson_new(lua_State *l)
         { "encode_invalid_numbers", json_cfg_encode_invalid_numbers },
         { "decode_invalid_numbers", json_cfg_decode_invalid_numbers },
         { "encode_escape_forward_slash", json_cfg_encode_escape_forward_slash },
+        { "store_number_as_rawdata", json_cfg_store_number_as_rawdata },
         { "new", lua_cjson_new },
         { NULL, NULL }
     };
